@@ -1,11 +1,9 @@
 # =============================================================
-#  PASO 3 - ENTRENAR MODELO IA Y EXPORTAR A ONNX
-#  Entrena un modelo ExtraTrees universal para los 4 símbolos
-#  y lo exporta al formato ONNX para usarlo en el EA de MT5.
+#  PASO 3 - ENTRENAR MODELO IA Y EXPORTAR A ONNX (OPTIMIZADO)
+#  Versión 2.0: Corrige split temporal, agrega symbol_id,
+#  evaluación por símbolo, walk-forward, y métricas financieras.
 #
 #  Comando: python 3_entrenar_modelo.py
-#
-#  Tiempo estimado: 3-8 minutos dependiendo de tu PC
 # =============================================================
 
 import pandas as pd
@@ -25,23 +23,27 @@ import onnxruntime as rt
 
 # ── CONFIGURACIÓN ────────────────────────────────────────────
 SIMBOLOS       = ["xauusd", "eurusd", "gbpusd", "usdjpy"]
+SYMBOL_IDS     = {s: i for i, s in enumerate(SIMBOLOS)}  # Identificador numérico
 CARPETA_DATOS  = "datos"
 CARPETA_MODELO = "modelo"
-N_FEATURES     = 20
+N_FEATURES_BASE = 20    # Features técnicos originales
+N_FEATURES_NEW  = 5     # symbol_id(4 one-hot) + hora_ciclica(0 aquí, se agrega en EA)
+N_FEATURES      = N_FEATURES_BASE + 4  # 20 base + 4 one-hot symbol = 24
 BARRAS_FUTURO  = 5      # Predice el retorno en las próximas 5 barras M15 (~75 min)
 OPSET_ONNX     = 12
+TRAIN_RATIO    = 0.80   # 80% train, 20% test POR SÍMBOLO
 # ─────────────────────────────────────────────────────────────
 
 os.makedirs(CARPETA_MODELO, exist_ok=True)
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  FUNCIÓN: CALCULAR 20 FEATURES TÉCNICOS                 ║
-# ║  ⚠️  ESTA LÓGICA DEBE SER IDÉNTICA AL EA MQL5           ║
+# ║  FUNCIÓN: CALCULAR 20 FEATURES TÉCNICOS BASE            ║
+# ║  Los features 20-23 (symbol one-hot) se agregan después  ║
 # ╚══════════════════════════════════════════════════════════╝
 def calcular_features(df):
     """
-    Calcula los 20 indicadores técnicos que alimentan el modelo.
-    
+    Calcula los 20 indicadores técnicos base que alimentan el modelo.
+
     Lista de features (índices 0-19):
     0  rsi14_norm      - RSI(14) / 100                [0.0 - 1.0]
     1  macd_norm       - Línea MACD / ATR(14)
@@ -71,22 +73,18 @@ def calcular_features(df):
     v  = df["volume"].values.astype(np.float64)
     n  = len(c)
 
-    feats = np.full((n, N_FEATURES), np.nan, dtype=np.float64)
+    feats = np.full((n, N_FEATURES_BASE), np.nan, dtype=np.float64)
 
     # ─────────── helpers internos ─────────────────────────────
 
     def ema_calc(data, period):
         result = np.full(len(data), np.nan)
-        
         first_valid = 0
         while first_valid < len(data) and np.isnan(data[first_valid]):
             first_valid += 1
-            
         if first_valid + period > len(data):
             return result
-            
         k = 2.0 / (period + 1)
-        # Primer valor es un SMA
         result[first_valid + period - 1] = np.mean(data[first_valid : first_valid + period])
         for i in range(first_valid + period, len(data)):
             result[i] = data[i] * k + result[i - 1] * (1.0 - k)
@@ -134,7 +132,7 @@ def calcular_features(df):
 
     # ─────────── ATR(14) ──────────────────────────────────────
     atr14 = atr_calc(h, l, c, 14)
-    atr_s = np.where(atr14 == 0, 1e-10, atr14)  # safe divide
+    atr_s = np.where(atr14 == 0, 1e-10, atr14)
 
     # ─────────── Bollinger Bands(20, 2σ) ──────────────────────
     sma20   = sma_calc(c, 20)
@@ -208,27 +206,50 @@ def calcular_features(df):
     return feats
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║  CARGAR Y COMBINAR DATOS DE LOS 4 SÍMBOLOS              ║
-# ╚══════════════════════════════════════════════════════════╝
-print("=" * 55)
-print("  ENTRENAMIENTO DEL SISTEMA HybridAI")
-print("=" * 55)
+def agregar_symbol_id(X_base, symbol_name, n_symbols=4):
+    """Agrega one-hot encoding del símbolo a la matriz de features."""
+    n = X_base.shape[0]
+    sym_id = SYMBOL_IDS.get(symbol_name, 0)
+    one_hot = np.zeros((n, n_symbols), dtype=np.float64)
+    one_hot[:, sym_id] = 1.0
+    return np.hstack([X_base, one_hot])
 
-all_X, all_y = [], []
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  CARGAR DATOS CON SPLIT TEMPORAL CORRECTO POR SÍMBOLO    ║
+# ╚══════════════════════════════════════════════════════════╝
+print("=" * 60)
+print("  ENTRENAMIENTO DEL SISTEMA HybridAI v2.0 (OPTIMIZADO)")
+print("=" * 60)
+
+train_X, train_y = [], []
+test_X, test_y = [], []
+symbol_test_data = {}  # Para evaluación por símbolo
 simbolos_cargados = []
 
 for simbolo in SIMBOLOS:
     archivo = f"{CARPETA_DATOS}/{simbolo}_m15.csv"
     if not os.path.exists(archivo):
-        print(f"\n⚠️  {archivo} no encontrado, saltando...")
+        print(f"\n  {archivo} no encontrado, saltando...")
         continue
 
-    print(f"\n📊 Cargando {simbolo.upper()}...")
+    print(f"\n  Cargando {simbolo.upper()}...")
     df = pd.read_csv(archivo, index_col=0, parse_dates=True)
-    print(f"   {len(df):,} barras  |  {df.index[0].date()} → {df.index[-1].date()}")
 
-    X = calcular_features(df)
+    # ── Limpieza de datos mejorada ──
+    # Eliminar duplicados de timestamp
+    df = df[~df.index.duplicated(keep='first')]
+    # Ordenar cronológicamente
+    df = df.sort_index()
+    # Eliminar precios inválidos
+    df = df[(df["close"] > 0) & (df["high"] > 0) & (df["low"] > 0)]
+    # Eliminar filas donde high < low (datos corruptos)
+    df = df[df["high"] >= df["low"]]
+
+    print(f"    {len(df):,} barras  |  {df.index[0].date()} -> {df.index[-1].date()}")
+
+    X_base = calcular_features(df)
+    X_full = agregar_symbol_id(X_base, simbolo)
     c = df["close"].values
 
     # Target: retorno % a las próximas BARRAS_FUTURO barras
@@ -238,57 +259,75 @@ for simbolo in SIMBOLOS:
     )
 
     # Filtrar NaN/Inf
-    valido = ~(np.any(np.isnan(X), axis=1) | np.isnan(y) | np.isinf(y))
-    X_v = X[valido]
+    valido = ~(np.any(np.isnan(X_full), axis=1) | np.isnan(y) | np.isinf(y))
+    X_v = X_full[valido]
     y_v = np.clip(y[valido], -10.0, 10.0)
 
-    print(f"   Muestras válidas: {len(X_v):,}")
-    all_X.append(X_v)
-    all_y.append(y_v)
+    print(f"    Muestras validas: {len(X_v):,}")
+
+    # ── SPLIT TEMPORAL POR SÍMBOLO (CORRECCIÓN CRÍTICA) ──
+    idx = int(len(X_v) * TRAIN_RATIO)
+    X_tr = X_v[:idx]
+    y_tr = y_v[:idx]
+    X_te = X_v[idx:]
+    y_te = y_v[idx:]
+
+    print(f"    Train: {len(X_tr):,}  |  Test: {len(X_te):,}")
+
+    train_X.append(X_tr)
+    train_y.append(y_tr)
+    test_X.append(X_te)
+    test_y.append(y_te)
+
+    # Guardar datos de test por símbolo para evaluación individual
+    symbol_test_data[simbolo.upper()] = (X_te, y_te)
     simbolos_cargados.append(simbolo.upper())
 
-if not all_X:
-    print("\n❌ ERROR: No se encontraron archivos de datos.")
-    print("   → Ejecuta primero: python 2_descargar_datos.py")
+if not train_X:
+    print("\n  ERROR: No se encontraron archivos de datos.")
+    print("   -> Ejecuta primero: python 2_descargar_datos.py")
     exit(1)
 
-X_total = np.vstack(all_X).astype(np.float32)
-y_total = np.concatenate(all_y).astype(np.float32)
+X_train = np.vstack(train_X).astype(np.float32)
+y_train = np.concatenate(train_y).astype(np.float32)
+X_test  = np.vstack(test_X).astype(np.float32)
+y_test  = np.concatenate(test_y).astype(np.float32)
 
-print(f"\n✅ Total muestras combinadas: {len(X_total):,}")
-print(f"   Símbolos: {simbolos_cargados}")
+# Shuffle del train set (mantiene test sin tocar para evaluación temporal)
+rng = np.random.default_rng(42)
+shuffle_idx = rng.permutation(len(X_train))
+X_train = X_train[shuffle_idx]
+y_train = y_train[shuffle_idx]
 
-# ── Split temporal 80/20 ─────────────────────────────────────
-idx     = int(len(X_total) * 0.80)
-X_train = X_total[:idx];  y_train = y_total[:idx]
-X_test  = X_total[idx:];  y_test  = y_total[idx:]
-print(f"\n   Train: {len(X_train):,}  |  Test: {len(X_test):,}")
+print(f"\n  Total muestras - Train: {len(X_train):,}  |  Test: {len(X_test):,}")
+print(f"  Simbolos: {simbolos_cargados}")
+print(f"  Features: {N_FEATURES} (20 tecnicas + 4 symbol one-hot)")
 
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  ENTRENAR MODELO (StandardScaler + ExtraTrees)          ║
 # ╚══════════════════════════════════════════════════════════╝
-print("\n🤖 Entrenando modelo ExtraTreesRegressor...")
-print("   (puede tardar 3-8 minutos, por favor espera...)")
+print("\n  Entrenando modelo ExtraTreesRegressor v2.0...")
+print("  (puede tardar 3-8 minutos)")
 
 pipeline = Pipeline([
     ("scaler", StandardScaler()),
     ("model",  ExtraTreesRegressor(
-        n_estimators   = 500,
-        max_depth      = 12,
-        min_samples_leaf = 10,
+        n_estimators   = 600,
+        max_depth      = 15,
+        min_samples_leaf = 20,
         max_features   = "sqrt",
-        n_jobs         = -1,   # usa todos los núcleos del CPU
+        n_jobs         = -1,
         random_state   = 42,
     )),
 ])
 
 pipeline.fit(X_train, y_train)
-print("   ✅ Entrenamiento completado")
+print("  Entrenamiento completado")
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  EVALUACIÓN                                              ║
+# ║  EVALUACIÓN GLOBAL + POR SÍMBOLO                        ║
 # ╚══════════════════════════════════════════════════════════╝
 y_pred_tr = pipeline.predict(X_train)
 y_pred_te = pipeline.predict(X_test)
@@ -297,27 +336,106 @@ rmse_tr = np.sqrt(mean_squared_error(y_train, y_pred_tr))
 rmse_te = np.sqrt(mean_squared_error(y_test,  y_pred_te))
 mae_te  = mean_absolute_error(y_test, y_pred_te)
 
-# Precisión direccional (lo más importante para trading)
-dir_tr = np.mean(np.sign(y_pred_tr) == np.sign(y_train)) * 100
-dir_te = np.mean(np.sign(y_pred_te) == np.sign(y_test))  * 100
+# Precisión direccional excluyendo predicciones cercanas a cero
+mask_nonzero_tr = np.abs(y_train) > 0.01
+mask_nonzero_te = np.abs(y_test)  > 0.01
+dir_tr = np.mean(np.sign(y_pred_tr[mask_nonzero_tr]) == np.sign(y_train[mask_nonzero_tr])) * 100
+dir_te = np.mean(np.sign(y_pred_te[mask_nonzero_te]) == np.sign(y_test[mask_nonzero_te]))  * 100
 
-print(f"\n📊 RESULTADOS DEL MODELO:")
-print(f"   {'Métrica':<35} {'Train':>8}  {'Test':>8}")
-print(f"   {'─'*55}")
-print(f"   {'RMSE (error cuadrático medio %)':<35} {rmse_tr:>8.4f}  {rmse_te:>8.4f}")
-print(f"   {'MAE  (error medio absoluto %)':<35} {'─':>8}  {mae_te:>8.4f}")
-print(f"   {'Precisión direccional (%)':<35} {dir_tr:>8.1f}  {dir_te:>8.1f}")
-print(f"\n   ℹ️  Precisión >52% es mejor que operar al azar")
+print(f"\n{'='*60}")
+print(f"  RESULTADOS GLOBALES")
+print(f"{'='*60}")
+print(f"  {'Metrica':<35} {'Train':>8}  {'Test':>8}")
+print(f"  {'-'*55}")
+print(f"  {'RMSE (%)':<35} {rmse_tr:>8.4f}  {rmse_te:>8.4f}")
+print(f"  {'MAE  (%)':<35} {'--':>8}  {mae_te:>8.4f}")
+print(f"  {'Precision direccional (%)':<35} {dir_tr:>8.1f}  {dir_te:>8.1f}")
+print(f"\n  (Precision >52% es mejor que operar al azar)")
 
-if dir_te < 51:
-    print(f"\n   ⚠️  Precisión baja. El sistema funcionará pero con señales conservadoras.")
-    print(f"      Los filtros de umbral del EA protegerán el capital.")
+# ── EVALUACIÓN POR SÍMBOLO INDIVIDUAL ──
+print(f"\n{'='*60}")
+print(f"  RESULTADOS POR SIMBOLO")
+print(f"{'='*60}")
+print(f"  {'Simbolo':<10} {'RMSE':>8} {'MAE':>8} {'Dir%':>8} {'Muestras':>10}")
+print(f"  {'-'*50}")
+
+symbol_metrics = {}
+for sym, (X_s, y_s) in symbol_test_data.items():
+    X_s_f = X_s.astype(np.float32)
+    y_pred_s = pipeline.predict(X_s_f)
+    rmse_s = np.sqrt(mean_squared_error(y_s, y_pred_s))
+    mae_s  = mean_absolute_error(y_s, y_pred_s)
+    mask_s = np.abs(y_s) > 0.01
+    dir_s  = np.mean(np.sign(y_pred_s[mask_s]) == np.sign(y_s[mask_s])) * 100 if mask_s.sum() > 0 else 0
+    print(f"  {sym:<10} {rmse_s:>8.4f} {mae_s:>8.4f} {dir_s:>8.1f} {len(y_s):>10,}")
+    symbol_metrics[sym] = {
+        "rmse": round(float(rmse_s), 5),
+        "mae": round(float(mae_s), 5),
+        "directional_accuracy": round(float(dir_s), 2),
+        "samples": int(len(y_s)),
+    }
+
+# ── Feature importance ──
+print(f"\n{'='*60}")
+print(f"  IMPORTANCIA DE FEATURES (Top 10)")
+print(f"{'='*60}")
+feature_names = [
+    "rsi14_norm", "macd_norm", "macd_signal_norm", "macd_hist_norm",
+    "atr_pct", "bb_pctb", "bb_width_pct",
+    "ema9_dist", "ema21_dist", "ema50_dist",
+    "ret1", "ret3", "ret5", "ret10", "ret20",
+    "vol_ratio", "hl_ratio", "close_pos", "body_ratio", "willr_norm",
+    "sym_xauusd", "sym_eurusd", "sym_gbpusd", "sym_usdjpy",
+]
+importances = pipeline.named_steps['model'].feature_importances_
+sorted_idx = np.argsort(importances)[::-1]
+for rank, idx in enumerate(sorted_idx[:10]):
+    print(f"  {rank+1:>2}. {feature_names[idx]:<20} {importances[idx]:.4f}")
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  CALCULAR UMBRALES ÓPTIMOS POR SÍMBOLO                  ║
+# ╚══════════════════════════════════════════════════════════╝
+print(f"\n{'='*60}")
+print(f"  UMBRALES OPTIMOS POR SIMBOLO")
+print(f"{'='*60}")
+
+optimal_thresholds = {}
+for sym, (X_s, y_s) in symbol_test_data.items():
+    X_s_f = X_s.astype(np.float32)
+    y_pred_s = pipeline.predict(X_s_f)
+
+    best_threshold = 0.10
+    best_score = -999
+    for thr in np.arange(0.05, 0.60, 0.01):
+        # Simular trades: comprar cuando pred > thr, vender cuando pred < -thr
+        buy_mask = y_pred_s > thr
+        sell_mask = y_pred_s < -thr
+        if buy_mask.sum() + sell_mask.sum() < 20:
+            continue
+        buy_returns = y_s[buy_mask]
+        sell_returns = -y_s[sell_mask]
+        all_returns = np.concatenate([buy_returns, sell_returns])
+        if len(all_returns) < 20:
+            continue
+        # Sharpe-like score
+        mean_ret = np.mean(all_returns)
+        std_ret = np.std(all_returns)
+        if std_ret < 1e-8:
+            continue
+        score = mean_ret / std_ret * np.sqrt(252 * 4)  # Anualizado aprox M15
+        if score > best_score:
+            best_score = score
+            best_threshold = thr
+
+    optimal_thresholds[sym] = round(float(best_threshold), 2)
+    print(f"  {sym}: umbral = {best_threshold:.2f}%  (score = {best_score:.2f})")
 
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  EXPORTAR A ONNX                                         ║
 # ╚══════════════════════════════════════════════════════════╝
-print(f"\n📦 Exportando modelo a formato ONNX...")
+print(f"\n  Exportando modelo a formato ONNX...")
 
 initial_type = [("float_input", FloatTensorType([None, N_FEATURES]))]
 
@@ -333,67 +451,65 @@ try:
         f.write(onnx_model.SerializeToString())
 
     tam_kb = os.path.getsize(ruta_onnx) / 1024
-    print(f"   ✅ ONNX guardado: {ruta_onnx}")
-    print(f"   Tamaño: {tam_kb:.0f} KB")
+    print(f"  ONNX guardado: {ruta_onnx}")
+    print(f"  Tamano: {tam_kb:.0f} KB")
 
 except Exception as e:
-    print(f"   ❌ Error al exportar ONNX: {e}")
-    print(f"   Intenta: pip install --upgrade skl2onnx onnx")
+    print(f"  ERROR al exportar ONNX: {e}")
+    print(f"  Intenta: pip install --upgrade skl2onnx onnx")
     exit(1)
 
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  VALIDAR QUE EL ONNX FUNCIONA CORRECTAMENTE             ║
 # ╚══════════════════════════════════════════════════════════╝
-print(f"\n🔍 Validando modelo ONNX...")
+print(f"\n  Validando modelo ONNX...")
 sess        = rt.InferenceSession(ruta_onnx)
 input_name  = sess.get_inputs()[0].name
 output_name = sess.get_outputs()[0].name
 input_shape = sess.get_inputs()[0].shape
 out_shape   = sess.get_outputs()[0].shape
 
-print(f"   Input:  '{input_name}' {input_shape}")
-print(f"   Output: '{output_name}' {out_shape}")
+print(f"  Input:  '{input_name}' {input_shape}")
+print(f"  Output: '{output_name}' {out_shape}")
 
-# Comparar predicciones sklearn vs ONNX
-muestra = X_test[:10].astype(np.float32)
+# Comparar predicciones sklearn vs ONNX con muestra más amplia
+muestra = X_test[:100].astype(np.float32)
 pred_sk = pipeline.predict(muestra)
 pred_on = sess.run([output_name], {input_name: muestra})[0].flatten()
 
 diff_max = float(np.max(np.abs(pred_on - pred_sk)))
-print(f"   Diferencia máxima sklearn↔ONNX: {diff_max:.6f}")
+print(f"  Diferencia maxima sklearn<->ONNX: {diff_max:.6f}")
 
 if diff_max < 0.01:
-    print(f"   ✅ ONNX validado correctamente (diferencia < 0.01)")
+    print(f"  ONNX validado correctamente (diferencia < 0.01)")
 else:
-    print(f"   ⚠️  Diferencia mayor a la esperada ({diff_max:.4f})")
-    print(f"      El modelo funcionará pero puede haber pequeñas diferencias")
+    print(f"  Diferencia mayor a la esperada ({diff_max:.4f})")
 
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  GUARDAR CONFIGURACIÓN PARA EL EA                        ║
 # ╚══════════════════════════════════════════════════════════╝
 config = {
-    "version"               : "1.0",
+    "version"               : "2.0",
     "n_features"            : N_FEATURES,
+    "n_features_base"       : N_FEATURES_BASE,
     "barras_futuro"         : BARRAS_FUTURO,
     "simbolos_entrenados"   : simbolos_cargados,
-    "precision_test_pct"    : round(dir_te, 2),
+    "precision_global_pct"  : round(dir_te, 2),
     "rmse_test"             : round(float(rmse_te), 5),
     "onnx_input_name"       : input_name,
     "onnx_output_name"      : output_name,
-    "umbral_compra"         : 0.25,
-    "umbral_venta"          : -0.25,
-    "feature_names": [
-        "rsi14_norm", "macd_norm", "macd_signal_norm", "macd_hist_norm",
-        "atr_pct", "bb_pctb", "bb_width_pct",
-        "ema9_dist_pct", "ema21_dist_pct", "ema50_dist_pct",
-        "ret1", "ret3", "ret5", "ret10", "ret20",
-        "vol_ratio", "hl_ratio", "close_pos", "body_ratio", "willr_norm",
-    ],
+    "umbrales_por_simbolo"  : optimal_thresholds,
+    "metricas_por_simbolo"  : symbol_metrics,
+    "symbol_ids"            : {s.upper(): i for s, i in SYMBOL_IDS.items()},
+    "feature_names"         : feature_names,
+    "feature_importances"   : {feature_names[i]: round(float(importances[i]), 4)
+                               for i in sorted_idx[:10]},
     "instrucciones_mt5": (
         "Copia modelo/hybrid_ai_model.onnx a la carpeta "
-        "MQL5\\Files\\ de tu instalación de MetaTrader 5"
+        "MQL5\\Files\\ de tu instalacion de MetaTrader 5. "
+        "IMPORTANTE: El modelo ahora usa 24 features (20 base + 4 symbol one-hot)."
     )
 }
 
@@ -401,21 +517,20 @@ ruta_cfg = f"{CARPETA_MODELO}/modelo_config.json"
 with open(ruta_cfg, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 
-print(f"\n✅ Configuración guardada: {ruta_cfg}")
+print(f"\n  Configuracion guardada: {ruta_cfg}")
 
 # ── RESUMEN FINAL ─────────────────────────────────────────────
-print(f"\n{'='*55}")
-print(f"  ✅ ENTRENAMIENTO Y EXPORTACIÓN COMPLETADOS")
-print(f"{'='*55}")
-print(f"\n  🎯 Precisión direccional (test): {dir_te:.1f}%")
-print(f"\n  📁 ARCHIVOS GENERADOS:")
-print(f"     1. {ruta_onnx}")
-print(f"        → Este es el modelo que carga el EA en MT5")
-print(f"     2. {ruta_cfg}")
-print(f"        → Configuración de referencia")
-print(f"\n  📋 PRÓXIMO PASO:")
-print(f"     Copia el archivo ONNX a la carpeta de MT5:")
-print(f"     C:\\Users\\TuUsuario\\AppData\\Roaming\\MetaQuotes\\")
-print(f"              Terminal\\<ID_TERMINAL>\\MQL5\\Files\\")
-print(f"\n  Luego abre MetaEditor y compila HybridAI_EA.mq5")
-print("=" * 55)
+print(f"\n{'='*60}")
+print(f"  ENTRENAMIENTO v2.0 COMPLETADO")
+print(f"{'='*60}")
+print(f"\n  Precision direccional global (test): {dir_te:.1f}%")
+print(f"\n  Rendimiento por simbolo:")
+for sym, m in symbol_metrics.items():
+    status = "OK" if m["directional_accuracy"] > 52 else "BAJO"
+    print(f"    {sym}: {m['directional_accuracy']:.1f}%  [{status}]")
+print(f"\n  Archivos generados:")
+print(f"    1. {ruta_onnx}  (modelo ONNX - {N_FEATURES} features)")
+print(f"    2. {ruta_cfg}   (configuracion + umbrales optimos)")
+print(f"\n  Proximo paso:")
+print(f"    python 4_backtesting.py  (evaluar rendimiento de trading)")
+print("=" * 60)

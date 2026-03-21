@@ -1,12 +1,15 @@
 //+------------------------------------------------------------------+
-//|                                             HybridAI_EA.mq5     |
-//|          Sistema de Trading con Inteligencia Artificial          |
+//|                                        HybridAI_EA.mq5  v2.0    |
+//|          Sistema de Trading con Inteligencia Artificial           |
 //|          Modelo: ExtraTrees + ONNX | Timeframe: M15              |
 //|          Instrumentos: XAU/USD, EUR/USD, GBP/USD, USD/JPY        |
+//|                                                                  |
+//|  v2.0: Trailing stop, filtro de spread, symbol_id (24 features), |
+//|        detección automática de filling mode, cierre de contrarias |
 //+------------------------------------------------------------------+
-#property copyright   "HybridAI Trading System 2026"
+#property copyright   "HybridAI Trading System 2026 v2.0"
 #property description "EA con modelo de IA (ONNX) para señales de trading"
-#property version     "1.00"
+#property version     "2.00"
 #property strict
 #property tester_file "hybrid_ai_model.onnx"
 
@@ -17,26 +20,37 @@
 //  PARÁMETROS DE ENTRADA
 //====================================================================
 
-input group "════ MODELO IA ════════════════════════════"
+input group "==== MODELO IA ==============================="
 input string   InpModelFile      = "hybrid_ai_model.onnx";
-//  ^── Nombre del archivo ONNX en la carpeta MQL5\Files\
+//  ^-- Nombre del archivo ONNX en la carpeta MQL5\Files\
 
-input group "════ UMBRALES DE SEÑAL ════════════════════"
-input double   InpUmbralCompra   =  0.0015;  // Comprar si predicción > este valor (%)
-input double   InpUmbralVenta    = -0.0015;  // Vender  si predicción < este valor (%)
+input group "==== UMBRALES DE SEÑAL ======================="
+input double   InpUmbralCompra   =  0.15;   // Comprar si predicción > este valor (%)
+input double   InpUmbralVenta    = -0.15;   // Vender  si predicción < este valor (%)
 
-input group "════ GESTIÓN DE RIESGO ════════════════════"
+input group "==== GESTIÓN DE RIESGO ======================="
 input double   InpRiesgoPct      =  1.0;    // Riesgo por operación (% del balance)
-input double   InpSL_ATR_Mult    =  2.0;    // Stop Loss  = ATR × este multiplicador
-input double   InpTP_ATR_Mult    =  3.0;    // Take Profit= ATR × este multiplicador
+input double   InpSL_ATR_Mult    =  2.0;    // Stop Loss  = ATR x este multiplicador
+input double   InpTP_ATR_Mult    =  3.0;    // Take Profit= ATR x este multiplicador
 input int      InpMaxTrades      =  1;      // Máximo de trades abiertos a la vez
 
-input group "════ FILTROS OPCIONALES ═══════════════════"
+input group "==== TRAILING STOP ==========================="
+input bool     InpTrailingStop   = true;     // Activar trailing stop
+input double   InpTrailATR_Mult  =  1.5;    // Trailing Stop = ATR x multiplicador
+input double   InpBreakeven_ATR  =  1.0;    // Mover SL a breakeven cuando ganancia > ATR x mult
+
+input group "==== FILTROS ================================="
 input bool     InpFiltroHora     = false;   // Activar filtro de hora
 input int      InpHoraInicio     =  7;      // Hora inicio (GMT)
 input int      InpHoraFin        = 20;      // Hora fin   (GMT)
+input bool     InpFiltroSpread   = true;    // Activar filtro de spread
+input double   InpMaxSpreadATR   =  0.10;   // Spread maximo como % del ATR
 
-input group "════ IDENTIFICACIÓN ═══════════════════════"
+input group "==== AVANZADO ================================"
+input bool     InpCerrarContraria = true;   // Cerrar posición contraria antes de abrir
+input int      InpSymbolID       = -1;      // ID del símbolo (-1=autodetect, 0=XAUUSD,1=EUR,2=GBP,3=JPY)
+
+input group "==== IDENTIFICACIÓN =========================="
 input int      InpMagicNumber    = 246810;  // Número mágico del EA
 
 //====================================================================
@@ -54,8 +68,35 @@ int       g_h_ema9   = INVALID_HANDLE;
 int       g_h_ema21  = INVALID_HANDLE;
 int       g_h_ema50  = INVALID_HANDLE;
 
-#define N_FEAT    20      // Total de features (debe coincidir con Python)
+int       g_symbol_id = 0;  // 0=XAUUSD, 1=EURUSD, 2=GBPUSD, 3=USDJPY
+
+#define N_FEAT    24      // 20 técnicos + 4 one-hot symbol (v2.0)
 #define LOOKBACK  60      // Barras mínimas para calentar indicadores
+
+//====================================================================
+//  DETECCIÓN AUTOMÁTICA DE FILLING MODE
+//====================================================================
+ENUM_ORDER_TYPE_FILLING DetectFillingMode()
+{
+   long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+//====================================================================
+//  AUTODETECCIÓN DEL SYMBOL ID
+//====================================================================
+int DetectSymbolID()
+{
+   string sym = _Symbol;
+   StringToUpper(sym);
+   if(StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0)  return 0;
+   if(StringFind(sym, "EURUSD") >= 0) return 1;
+   if(StringFind(sym, "GBPUSD") >= 0) return 2;
+   if(StringFind(sym, "USDJPY") >= 0) return 3;
+   return 0;  // Default
+}
 
 //====================================================================
 //  INICIALIZACIÓN
@@ -63,38 +104,41 @@ int       g_h_ema50  = INVALID_HANDLE;
 
 int OnInit()
 {
-   //── Configurar objeto de trading ────────────────────────────
+   //-- Configurar objeto de trading
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(30);
-   g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   g_trade.SetTypeFilling(DetectFillingMode());
 
-   //── Cargar el modelo ONNX ───────────────────────────────────
+   //-- Detectar symbol ID
+   g_symbol_id = (InpSymbolID >= 0) ? InpSymbolID : DetectSymbolID();
+
+   //-- Cargar el modelo ONNX
    g_onnx = OnnxCreate(InpModelFile, ONNX_DEFAULT);
 
    if(g_onnx == INVALID_HANDLE)
    {
-      Alert("❌ HybridAI: No se pudo cargar ONNX: ", InpModelFile,
+      Alert("HybridAI: No se pudo cargar ONNX: ", InpModelFile,
             "\n\nVerifica que copiaste el archivo a:\n",
-            "MT5 → File → Open Data Folder → MQL5 → Files");
+            "MT5 -> File -> Open Data Folder -> MQL5 -> Files");
       return INIT_FAILED;
    }
 
-   //── Configurar shapes de entrada/salida del modelo ONNX ─────
-   long sh_in[]  = {1, N_FEAT};   // [batch=1, features=20]
-   long sh_out[] = {1, 1};        // [batch=1, outputs=1]  → un valor float de predicción
+   //-- Configurar shapes de entrada/salida del modelo ONNX
+   long sh_in[]  = {1, N_FEAT};   // [batch=1, features=24]
+   long sh_out[] = {1, 1};        // [batch=1, outputs=1]
 
    if(!OnnxSetInputShape(g_onnx, 0, sh_in))
    {
-      Alert("❌ HybridAI: Error configurando input shape. Código: ", GetLastError());
+      Alert("HybridAI: Error configurando input shape. Código: ", GetLastError());
       return INIT_FAILED;
    }
    if(!OnnxSetOutputShape(g_onnx, 0, sh_out))
    {
-      Alert("❌ HybridAI: Error configurando output shape. Código: ", GetLastError());
+      Alert("HybridAI: Error configurando output shape. Código: ", GetLastError());
       return INIT_FAILED;
    }
 
-   //── Crear handles de indicadores técnicos ───────────────────
+   //-- Crear handles de indicadores técnicos
    g_h_atr  = iATR (_Symbol, PERIOD_CURRENT, 14);
    g_h_rsi  = iRSI (_Symbol, PERIOD_CURRENT, 14, PRICE_CLOSE);
    g_h_macd = iMACD(_Symbol, PERIOD_CURRENT, 12, 26, 9, PRICE_CLOSE);
@@ -103,24 +147,31 @@ int OnInit()
    g_h_ema21 = iMA  (_Symbol, PERIOD_CURRENT, 21, 0, MODE_EMA, PRICE_CLOSE);
    g_h_ema50 = iMA  (_Symbol, PERIOD_CURRENT, 50, 0, MODE_EMA, PRICE_CLOSE);
 
-   //── Validar handles ─────────────────────────────────────────
+   //-- Validar handles
    if(g_h_atr  == INVALID_HANDLE || g_h_rsi  == INVALID_HANDLE ||
       g_h_macd == INVALID_HANDLE || g_h_bb   == INVALID_HANDLE ||
       g_h_ema9  == INVALID_HANDLE || g_h_ema21 == INVALID_HANDLE ||
       g_h_ema50 == INVALID_HANDLE)
    {
-      Alert("❌ HybridAI: Error al crear indicadores. Código: ", GetLastError());
+      Alert("HybridAI: Error al crear indicadores. Código: ", GetLastError());
       return INIT_FAILED;
    }
 
-   //── Log de inicio ────────────────────────────────────────────
-   Print("╔════════════════════════════════════════╗");
-   Print("║    HybridAI EA - Sistema de Trading    ║");
-   Print("╚════════════════════════════════════════╝");
-   Print("  Símbolo : ", _Symbol, "  |  Timeframe : ", EnumToString(PERIOD_CURRENT));
-   Print("  Modelo  : ", InpModelFile, "  → CARGADO ✅");
-   Print("  Umbral  : Compra >", InpUmbralCompra, "%  |  Venta <", InpUmbralVenta, "%");
-   Print("  Riesgo  : ", InpRiesgoPct, "% por trade  |  SL=", InpSL_ATR_Mult, "×ATR  |  TP=", InpTP_ATR_Mult, "×ATR");
+   //-- Log de inicio
+   Print("================================================================");
+   Print("    HybridAI EA v2.0 - Sistema de Trading con IA");
+   Print("================================================================");
+   Print("  Simbolo  : ", _Symbol, "  (ID=", g_symbol_id, ")");
+   Print("  Timeframe: ", EnumToString(PERIOD_CURRENT));
+   Print("  Modelo   : ", InpModelFile, " -> CARGADO (", N_FEAT, " features)");
+   Print("  Umbral   : Compra >", InpUmbralCompra, "%  |  Venta <", InpUmbralVenta, "%");
+   Print("  Riesgo   : ", InpRiesgoPct, "%  |  SL=", InpSL_ATR_Mult, "xATR  |  TP=", InpTP_ATR_Mult, "xATR");
+   Print("  Trailing : ", InpTrailingStop ? "ON" : "OFF",
+         "  (", InpTrailATR_Mult, "xATR, BE=", InpBreakeven_ATR, "xATR)");
+   Print("  Spread   : ", InpFiltroSpread ? "Filtro ON" : "Sin filtro",
+         "  (max ", InpMaxSpreadATR*100, "% ATR)");
+   Print("  Filling  : ", EnumToString(DetectFillingMode()));
+   Print("================================================================");
 
    return INIT_SUCCEEDED;
 }
@@ -137,7 +188,7 @@ void OnDeinit(const int reason)
    for(int i = 0; i < ArraySize(handles); i++)
       if(handles[i] != INVALID_HANDLE) IndicatorRelease(handles[i]);
 
-   Print("HybridAI detenido.");
+   Print("HybridAI v2.0 detenido.");
 }
 
 //====================================================================
@@ -146,16 +197,16 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   //── Solo actuar en una nueva barra completada ────────────────
+   //-- Solo actuar en una nueva barra completada
    static datetime ultima_barra = 0;
    datetime barra_actual = iTime(_Symbol, PERIOD_CURRENT, 0);
    if(barra_actual == ultima_barra) return;
    ultima_barra = barra_actual;
 
-   //── Esperar suficientes barras para indicadores ──────────────
+   //-- Esperar suficientes barras para indicadores
    if(Bars(_Symbol, PERIOD_CURRENT) < LOOKBACK) return;
 
-   //── Filtro de hora (opcional) ────────────────────────────────
+   //-- Filtro de hora (opcional)
    if(InpFiltroHora)
    {
       MqlDateTime dt;
@@ -163,54 +214,78 @@ void OnTick()
       if(dt.hour < InpHoraInicio || dt.hour >= InpHoraFin) return;
    }
 
-   //── Calcular los 20 features ─────────────────────────────────
+   //-- Gestionar trailing stop de posiciones abiertas
+   if(InpTrailingStop)
+      GestionarTrailingStop();
+
+   //-- Obtener ATR para filtro de spread
+   double atr_check[];
+   ArraySetAsSeries(atr_check, true);
+   if(CopyBuffer(g_h_atr, 0, 1, 1, atr_check) < 1) return;
+   double atr_current = atr_check[0];
+
+   //-- Filtro de spread
+   if(InpFiltroSpread && atr_current > 0)
+   {
+      double spread_val = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+      if(spread_val > atr_current * InpMaxSpreadATR) return;
+   }
+
+   //-- Calcular los 24 features
    matrixf features(1, N_FEAT);
    if(!CalcularFeatures(features)) return;
 
-   //── Ejecutar inferencia ONNX ─────────────────────────────────
+   //-- Ejecutar inferencia ONNX
    vectorf salida(1);
    if(!OnnxRun(g_onnx, ONNX_DEFAULT, features, salida))
    {
-      Print("⚠️  OnnxRun falló en ", TimeToString(barra_actual), " | Error: ", GetLastError());
+      Print("OnnxRun fallo en ", TimeToString(barra_actual), " | Error: ", GetLastError());
       return;
    }
 
    double prediccion = (double)salida[0];
 
-   //── Log cada 10 barras ───────────────────────────────────────
+   //-- Log cada 10 barras
    static int cnt = 0;
    if(++cnt % 10 == 0)
-      Print("📊 ", _Symbol, " | ", TimeToString(barra_actual, TIME_DATE|TIME_MINUTES),
-            " | Predicción IA: ", DoubleToString(prediccion, 4), "%");
+      Print(_Symbol, " | ", TimeToString(barra_actual, TIME_DATE|TIME_MINUTES),
+            " | Prediccion IA: ", DoubleToString(prediccion, 4), "%");
 
-   //── Contar posiciones abiertas ───────────────────────────────
+   //-- Contar posiciones abiertas
    int n_buy  = ContarPosiciones(POSITION_TYPE_BUY);
    int n_sell = ContarPosiciones(POSITION_TYPE_SELL);
    int n_tot  = n_buy + n_sell;
 
-   //── SEÑAL DE COMPRA ──────────────────────────────────────────
+   //-- SEÑAL DE COMPRA
    if(prediccion > InpUmbralCompra)
    {
+      // Cerrar posición contraria si existe
+      if(InpCerrarContraria && n_sell > 0)
+         CerrarPosiciones(POSITION_TYPE_SELL);
+
       if(n_buy == 0 && n_tot < InpMaxTrades)
          AbrirOperacion(ORDER_TYPE_BUY, prediccion);
    }
-   //── SEÑAL DE VENTA ───────────────────────────────────────────
+   //-- SEÑAL DE VENTA
    else if(prediccion < InpUmbralVenta)
    {
+      if(InpCerrarContraria && n_buy > 0)
+         CerrarPosiciones(POSITION_TYPE_BUY);
+
       if(n_sell == 0 && n_tot < InpMaxTrades)
          AbrirOperacion(ORDER_TYPE_SELL, prediccion);
    }
 }
 
 //====================================================================
-//  CALCULAR 20 FEATURES  ← DEBE SER IDÉNTICO AL PYTHON
+//  CALCULAR 24 FEATURES  <- DEBE SER IDÉNTICO AL PYTHON v2.0
 //====================================================================
 
 bool CalcularFeatures(matrixf &feat)
 {
    const int LB = 55;   // barras históricas a pedir
 
-   //── Obtener OHLCV ────────────────────────────────────────────
+   //-- Obtener OHLCV
    double close[], high[], low[];
    double open_arr[];
    long   vol[];
@@ -227,14 +302,13 @@ bool CalcularFeatures(matrixf &feat)
    if(CopyOpen      (_Symbol, PERIOD_CURRENT, 1, LB+5, open_arr) < LB) return false;
    if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 1, LB+5, vol)      < LB) return false;
 
-   //── Obtener buffers de indicadores ───────────────────────────
-   double atr[], rsi[], macd_m[], macd_s[], macd_h[];
+   //-- Obtener buffers de indicadores
+   double atr[], rsi[], macd_m[], macd_s[];
    double bb_u[], bb_mid[], bb_l[];
    double ema9a[], ema21a[], ema50a[];
 
    ArraySetAsSeries(atr,    true);  ArraySetAsSeries(rsi,    true);
    ArraySetAsSeries(macd_m, true);  ArraySetAsSeries(macd_s, true);
-   ArraySetAsSeries(macd_h, true);
    ArraySetAsSeries(bb_u,   true);  ArraySetAsSeries(bb_mid, true);
    ArraySetAsSeries(bb_l,   true);
    ArraySetAsSeries(ema9a,  true);  ArraySetAsSeries(ema21a, true);
@@ -244,7 +318,6 @@ bool CalcularFeatures(matrixf &feat)
    if(CopyBuffer(g_h_rsi,   0, 1, LB, rsi)    < LB) return false;
    if(CopyBuffer(g_h_macd,  0, 1, LB, macd_m) < LB) return false;
    if(CopyBuffer(g_h_macd,  1, 1, LB, macd_s) < LB) return false;
-   // El histograma MACD se calcula manualmente porque iMACD solo tiene 2 buffers (0 y 1) en MT5.
    if(CopyBuffer(g_h_bb,    1, 1, LB, bb_u)   < LB) return false;
    if(CopyBuffer(g_h_bb,    0, 1, LB, bb_mid) < LB) return false;
    if(CopyBuffer(g_h_bb,    2, 1, LB, bb_l)   < LB) return false;
@@ -252,7 +325,7 @@ bool CalcularFeatures(matrixf &feat)
    if(CopyBuffer(g_h_ema21, 0, 1, LB, ema21a) < LB) return false;
    if(CopyBuffer(g_h_ema50, 0, 1, LB, ema50a) < LB) return false;
 
-   //── Valores de la barra más reciente completada (índice 0) ───
+   //-- Valores de la barra más reciente completada (índice 0)
    double c0   = close[0];
    double h0   = high[0];
    double l0   = low[0];
@@ -264,12 +337,12 @@ bool CalcularFeatures(matrixf &feat)
    double bb_ancho = bb_u[0] - bb_l[0];
    double hl_rango = h0 - l0;
 
-   //── Volumen medio 20 barras ────────────────────────────────
+   //-- Volumen medio 20 barras
    double vol_sum = 0;
    for(int i = 0; i < 20; i++) vol_sum += (double)vol[i];
    double vol_ma = vol_sum / 20.0;
 
-   //── Williams %R(14) ────────────────────────────────────────
+   //-- Williams %R(14)
    double max_h = high[0], min_l = low[0];
    for(int i = 1; i < 14; i++)
    {
@@ -278,7 +351,7 @@ bool CalcularFeatures(matrixf &feat)
    }
    double willr_rng = max_h - min_l;
 
-   //── Asignar features (misma lógica que calcular_features en Python) ──
+   //-- Features 0-19: técnicos (misma lógica que Python)
 
    // 0  RSI normalizado
    feat[0][0]  = (float)(rsi[0] / 100.0);
@@ -301,7 +374,6 @@ bool CalcularFeatures(matrixf &feat)
    feat[0][9]  = (float)(ema50a[0] > 0 ? (c0 - ema50a[0]) / ema50a[0] * 100.0 : 0.0);
 
    // 10-14  Retornos históricos (%)
-   // Nota: close[0]=barra reciente, close[N]=N barras atrás
    feat[0][10] = (float)(close[1]  > 0 ? (c0 - close[1])  / close[1]  * 100.0 : 0.0);
    feat[0][11] = (float)(close[3]  > 0 ? (c0 - close[3])  / close[3]  * 100.0 : 0.0);
    feat[0][12] = (float)(close[5]  > 0 ? (c0 - close[5])  / close[5]  * 100.0 : 0.0);
@@ -322,6 +394,12 @@ bool CalcularFeatures(matrixf &feat)
 
    // 19  Williams %R normalizado [0,1]
    feat[0][19] = (float)(willr_rng > 0 ? (c0 - min_l) / willr_rng : 0.5);
+
+   //-- Features 20-23: Symbol one-hot encoding (v2.0)
+   feat[0][20] = (float)(g_symbol_id == 0 ? 1.0 : 0.0);  // XAUUSD
+   feat[0][21] = (float)(g_symbol_id == 1 ? 1.0 : 0.0);  // EURUSD
+   feat[0][22] = (float)(g_symbol_id == 2 ? 1.0 : 0.0);  // GBPUSD
+   feat[0][23] = (float)(g_symbol_id == 3 ? 1.0 : 0.0);  // USDJPY
 
    return true;
 }
@@ -350,11 +428,19 @@ void AbrirOperacion(ENUM_ORDER_TYPE tipo, double pred)
    else
    { sl = price + sl_d;  tp = price - tp_d; }
 
+   // Normalizar SL/TP a tick size
+   double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick > 0)
+   {
+      sl = MathRound(sl / tick) * tick;
+      tp = MathRound(tp / tick) * tick;
+   }
+
    double lots = CalcularLotes(sl_d);
    if(lots <= 0) return;
 
-   string dir = (tipo == ORDER_TYPE_BUY) ? "COMPRA 📈" : "VENTA  📉";
-   Print("🚀 ", dir,
+   string dir = (tipo == ORDER_TYPE_BUY) ? "COMPRA" : "VENTA";
+   Print(">> ", dir,
          " | Pred=", DoubleToString(pred, 4), "%",
          " | Precio=", DoubleToString(price, _Digits),
          " | SL=",     DoubleToString(sl,    _Digits),
@@ -368,7 +454,7 @@ void AbrirOperacion(ENUM_ORDER_TYPE tipo, double pred)
       ok = g_trade.Sell(lots, _Symbol, price, sl, tp, "HybridAI-SELL");
 
    if(!ok)
-      Print("❌ Error al abrir: ", g_trade.ResultRetcodeDescription());
+      Print("Error al abrir: ", g_trade.ResultRetcodeDescription());
 }
 
 //====================================================================
@@ -398,6 +484,93 @@ double CalcularLotes(double distancia_sl)
    lotes = MathMax(vol_min, MathMin(vol_max, lotes));
 
    return lotes;
+}
+
+//====================================================================
+//  TRAILING STOP - GESTIÓN DINÁMICA DE SL
+//====================================================================
+
+void GestionarTrailingStop()
+{
+   double atr_arr[];
+   ArraySetAsSeries(atr_arr, true);
+   if(CopyBuffer(g_h_atr, 0, 1, 1, atr_arr) < 1) return;
+   double atr_val = atr_arr[0];
+   if(atr_val <= 0) return;
+
+   double trail_dist = atr_val * InpTrailATR_Mult;
+   double be_dist    = atr_val * InpBreakeven_ATR;
+   double tick       = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick <= 0) tick = _Point;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+
+      double pos_open  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double pos_sl    = PositionGetDouble(POSITION_SL);
+      double pos_tp    = PositionGetDouble(POSITION_TP);
+      long   pos_type  = PositionGetInteger(POSITION_TYPE);
+      ulong  pos_ticket = PositionGetInteger(POSITION_TICKET);
+
+      if(pos_type == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double profit_dist = bid - pos_open;
+
+         // Breakeven: mover SL a entry cuando ganancia > be_dist
+         if(profit_dist >= be_dist && pos_sl < pos_open)
+         {
+            double new_sl = MathRound(pos_open / tick) * tick;
+            if(new_sl > pos_sl)
+               g_trade.PositionModify(pos_ticket, new_sl, pos_tp);
+         }
+         // Trail: mover SL a bid - trail_dist
+         else if(profit_dist >= trail_dist)
+         {
+            double new_sl = MathRound((bid - trail_dist) / tick) * tick;
+            if(new_sl > pos_sl)
+               g_trade.PositionModify(pos_ticket, new_sl, pos_tp);
+         }
+      }
+      else if(pos_type == POSITION_TYPE_SELL)
+      {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double profit_dist = pos_open - ask;
+
+         if(profit_dist >= be_dist && (pos_sl > pos_open || pos_sl == 0))
+         {
+            double new_sl = MathRound(pos_open / tick) * tick;
+            if(new_sl < pos_sl || pos_sl == 0)
+               g_trade.PositionModify(pos_ticket, new_sl, pos_tp);
+         }
+         else if(profit_dist >= trail_dist)
+         {
+            double new_sl = MathRound((ask + trail_dist) / tick) * tick;
+            if(new_sl < pos_sl || pos_sl == 0)
+               g_trade.PositionModify(pos_ticket, new_sl, pos_tp);
+         }
+      }
+   }
+}
+
+//====================================================================
+//  CERRAR POSICIONES DE UN TIPO (para cerrar contrarias)
+//====================================================================
+
+void CerrarPosiciones(ENUM_POSITION_TYPE tipo)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != tipo) continue;
+
+      ulong ticket = PositionGetInteger(POSITION_TICKET);
+      g_trade.PositionClose(ticket);
+      Print("Cerrada posicion contraria #", ticket);
+   }
 }
 
 //====================================================================

@@ -1,0 +1,58 @@
+{
+  "XAUUSD": {
+    "symbol_id": 0,
+    "description": "Gold vs USD (Commodity)",
+    "threshold_buy": 0.20,
+    "threshold_sell": -0.20,
+    "sl_atr_mult": 2.5,
+    "tp_atr_mult": 4.0,
+    "spread_pips": 0.30,
+    "commission_per_lot": 7.0,
+    "slippage_pips": 0.10,
+    "lot_value": 100,
+    "optimal_sessions_gmt": [7, 20],
+    "notes": "Mayor volatilidad, requiere umbrales más amplios"
+  },
+  "EURUSD": {
+    "symbol_id": 1,
+    "description": "Euro vs USD (Major FX)",
+    "threshold_buy": 0.15,
+    "threshold_sell": -0.15,
+    "sl_atr_mult": 2.0,
+    "tp_atr_mult": 3.0,
+    "spread_pips": 0.00010,
+    "commission_per_lot": 7.0,
+    "slippage_pips": 0.00003,
+    "lot_value": 100000,
+    "optimal_sessions_gmt": [7, 16],
+    "notes": "Liquidez alta, spreads bajos, sesión Londres"
+  },
+  "GBPUSD": {
+    "symbol_id": 2,
+    "description": "British Pound vs USD (Major FX)",
+    "threshold_buy": 0.15,
+    "threshold_sell": -0.15,
+    "sl_atr_mult": 2.0,
+    "tp_atr_mult": 3.5,
+    "spread_pips": 0.00015,
+    "commission_per_lot": 7.0,
+    "slippage_pips": 0.00004,
+    "lot_value": 100000,
+    "optimal_sessions_gmt": [7, 16],
+    "notes": "Volatilidad media-alta, sensible a noticias UK"
+  },
+  "USDJPY": {
+    "symbol_id": 3,
+    "description": "USD vs Japanese Yen (Yen cross)",
+    "threshold_buy": 0.10,
+    "threshold_sell": -0.10,
+    "sl_atr_mult": 1.5,
+    "tp_atr_mult": 2.5,
+    "spread_pips": 0.012,
+    "commission_per_lot": 7.0,
+    "slippage_pips": 0.004,
+    "lot_value_formula": "100000/price",
+    "optimal_sessions_gmt": [0, 10],
+    "notes": "Menor volatilidad, sesión Tokio + Londres, trending"
+  }
+}
