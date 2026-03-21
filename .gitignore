@@ -1,0 +1,9 @@
+__pycache__/
+*.csv
+datos/
+modelo/
+*.onnx
+.vscode/
+
+# Exception: We want the model config maybe?
+!modelo/modelo_config.json
