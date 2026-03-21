@@ -230,9 +230,17 @@ def walk_forward_symbol(df, simbolo, verbose=True):
         mask_nz = np.abs(y_te) > 0.01
         dir_acc = np.mean(np.sign(y_pred[mask_nz]) == np.sign(y_te[mask_nz])) * 100 if mask_nz.sum() > 0 else 50.0
 
-        # Simular retornos de trading simple
-        buy_mask = y_pred > 0.10
-        sell_mask = y_pred < -0.10
+        # Simular retornos de trading con umbral adaptativo
+        # Usar percentil de predicciones para generar trades significativos
+        abs_preds = np.abs(y_pred)
+        if len(abs_preds) > 0:
+            # Umbral = percentil 70 de |predicciones| (top 30% de señales)
+            adaptive_thr = max(np.percentile(abs_preds, 70), 0.005)
+        else:
+            adaptive_thr = 0.01
+
+        buy_mask = y_pred > adaptive_thr
+        sell_mask = y_pred < -adaptive_thr
         buy_ret = y_te[buy_mask]
         sell_ret = -y_te[sell_mask]
         trade_rets = np.concatenate([buy_ret, sell_ret]) if (len(buy_ret) + len(sell_ret)) > 0 else np.array([0])
@@ -243,21 +251,23 @@ def walk_forward_symbol(df, simbolo, verbose=True):
 
         fold_result = {
             "fold": fold,
-            "train_size": len(X_tr),
-            "test_size": len(X_te),
+            "train_size": int(len(X_tr)),
+            "test_size": int(len(X_te)),
             "rmse": round(float(rmse), 5),
             "directional_accuracy": round(float(dir_acc), 2),
-            "n_trades": n_trades,
+            "n_trades": int(n_trades),
+            "threshold_used": round(float(adaptive_thr), 5),
             "mean_trade_return": round(float(mean_ret), 4),
             "sharpe_approx": round(float(sharpe_approx), 2),
-            "profitable": mean_ret > 0,
+            "profitable": bool(mean_ret > 0),
         }
         results.append(fold_result)
 
         if verbose:
             status = "OK" if mean_ret > 0 else "NEG"
             print(f"    Fold {fold:>2}: Dir={dir_acc:5.1f}%  RMSE={rmse:.4f}  "
-                  f"Trades={n_trades:>4}  Ret={mean_ret:+.3f}%  [{status}]")
+                  f"Thr={adaptive_thr:.4f}  Trades={n_trades:>4}  "
+                  f"Ret={mean_ret:+.3f}%  [{status}]")
 
         start += STEP_BARS
 
@@ -312,9 +322,9 @@ if __name__ == "__main__":
 
             all_wf_results[simbolo.upper()] = {
                 "folds": results,
-                "n_folds": n_folds,
-                "n_profitable": n_profitable,
-                "consistency_pct": round(consistency, 1),
+                "n_folds": int(n_folds),
+                "n_profitable": int(n_profitable),
+                "consistency_pct": round(float(consistency), 1),
                 "avg_directional_accuracy": round(float(avg_dir), 2),
                 "avg_sharpe": round(float(avg_sharpe), 2),
             }
