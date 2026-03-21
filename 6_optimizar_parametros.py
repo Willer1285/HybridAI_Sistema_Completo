@@ -1,7 +1,7 @@
 # =============================================================
-#  PASO 6 - OPTIMIZACIÓN DE HIPERPARÁMETROS Y PARÁMETROS DE TRADING
-#  Busca la mejor combinación de modelo + parámetros de trading
-#  para cada símbolo usando validación temporal.
+#  PASO 6 - OPTIMIZACIÓN DE PARÁMETROS v3.0
+#  Solo XAUUSD. Busca la mejor combinación de modelo +
+#  parámetros de trading usando validación temporal.
 #
 #  Comando: python 6_optimizar_parametros.py
 # =============================================================
@@ -20,40 +20,33 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
 
 # ── CONFIGURACIÓN ────────────────────────────────────────────
-SIMBOLOS       = ["xauusd", "eurusd", "gbpusd", "usdjpy"]
-SYMBOL_IDS     = {s: i for i, s in enumerate(SIMBOLOS)}
-CARPETA_DATOS  = "datos"
-CARPETA_MODELO = "modelo"
-N_FEATURES_BASE = 20
+SIMBOLO         = "xauusd"
+CARPETA_DATOS   = "datos"
+CARPETA_MODELO  = "modelo"
 N_FEATURES      = 24
 BARRAS_FUTURO   = 5
 
 # Grid de hiperparámetros del modelo
 MODEL_GRID = {
-    "n_estimators": [400, 600],
-    "max_depth": [10, 15, 20],
-    "min_samples_leaf": [10, 20, 50],
+    "n_estimators": [400, 500, 600],
+    "max_depth": [8, 10, 12],
+    "min_samples_leaf": [30, 50, 80],
 }
 
 # Grid de parámetros de trading
 TRADING_GRID = {
     "threshold": [0.05, 0.10, 0.15, 0.20, 0.30],
     "sl_atr_mult": [1.5, 2.0, 2.5, 3.0],
-    "tp_atr_mult": [2.0, 3.0, 4.0, 5.0],
+    "tp_atr_mult": [2.5, 3.0, 3.5, 4.0, 5.0],
 }
 
-# Spreads por símbolo
-SPREAD_COST_PCT = {
-    "xauusd": 0.015,   # ~$0.30 / $2000 = 0.015%
-    "eurusd": 0.009,    # ~1.0 pip / 1.10 = 0.009%
-    "gbpusd": 0.012,    # ~1.5 pip / 1.25 = 0.012%
-    "usdjpy": 0.008,    # ~1.2 pip / 150 = 0.008%
-}
+# Costo XAUUSD
+SPREAD_COST_PCT = 0.015   # ~$0.30 / $2000 = 0.015%
 # ─────────────────────────────────────────────────────────────
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  FUNCIONES DE FEATURES                                   ║
+# ║  FUNCIONES DE FEATURES v3.0                              ║
 # ╚══════════════════════════════════════════════════════════╝
 
 def ema_calc(data, period):
@@ -87,44 +80,60 @@ def atr_calc(h_, l_, c_, period):
         result[i] = (result[i - 1] * (period - 1) + tr[i]) / period
     return result
 
-def calcular_features_array(c, h, l, o, v):
-    n = len(c)
-    feats = np.full((n, N_FEATURES_BASE), np.nan, dtype=np.float64)
 
+def calcular_features_v3(df):
+    """Calcula los 24 features v3.0 para XAUUSD."""
+    c = df["close"].values.astype(np.float64)
+    h = df["high"].values.astype(np.float64)
+    l = df["low"].values.astype(np.float64)
+    o = df["open"].values.astype(np.float64)
+    v = df["volume"].values.astype(np.float64)
+    n = len(c)
+
+    feats = np.full((n, N_FEATURES), np.nan, dtype=np.float64)
+
+    # RSI(14)
     rsi_p = 14
     delta = np.diff(c)
-    gain  = np.where(delta > 0,  delta, 0.0)
-    loss  = np.where(delta < 0, -delta, 0.0)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
     ag = np.full(n, np.nan); al = np.full(n, np.nan)
     ag[rsi_p] = np.mean(gain[:rsi_p]); al[rsi_p] = np.mean(loss[:rsi_p])
     for i in range(rsi_p + 1, n):
         ag[i] = (ag[i-1] * (rsi_p-1) + gain[i-1]) / rsi_p
         al[i] = (al[i-1] * (rsi_p-1) + loss[i-1]) / rsi_p
-    rs  = np.where(al == 0, 100.0, ag / al)
+    rs = np.where(al == 0, 100.0, ag / al)
     rsi = 100.0 - (100.0 / (1.0 + rs)); rsi[:rsi_p] = np.nan
 
+    # MACD
     ema12 = ema_calc(c, 12); ema26 = ema_calc(c, 26)
     macd_line = ema12 - ema26
-    macd_sig  = ema_calc(macd_line, 9); macd_hist = macd_line - macd_sig
+    macd_sig = ema_calc(macd_line, 9); macd_hist = macd_line - macd_sig
 
+    # ATR
     atr14 = atr_calc(h, l, c, 14)
     atr_s = np.where(atr14 == 0, 1e-10, atr14)
 
+    # Bollinger
     sma20 = sma_calc(c, 20)
     std20 = np.full(n, np.nan)
     for i in range(19, n):
         std20[i] = np.std(c[i-19:i+1], ddof=0)
     bb_up = sma20 + 2.0 * std20; bb_lo = sma20 - 2.0 * std20
-    bb_w  = bb_up - bb_lo
+    bb_w = bb_up - bb_lo
     bb_pctb = np.where(bb_w == 0, 0.5, (c - bb_lo) / bb_w)
-    bb_bwp  = np.where(sma20 == 0, np.nan, bb_w / sma20)
+    bb_bwp = np.where(sma20 == 0, np.nan, bb_w / sma20)
 
+    # EMAs
     ema9 = ema_calc(c, 9); ema21 = ema_calc(c, 21); ema50 = ema_calc(c, 50)
 
     def ret(data, p):
-        r = np.full(n, np.nan); r[p:] = (data[p:] - data[:-p]) / data[:-p] * 100.0; return r
+        r = np.full(n, np.nan)
+        r[p:] = (data[p:] - data[:-p]) / data[:-p] * 100.0
+        return r
 
-    vol_ma = sma_calc(v, 20); vol_rt = np.where(vol_ma == 0, 1.0, v / vol_ma)
+    vol_ma = sma_calc(v, 20)
+    vol_rt = np.where(vol_ma == 0, 1.0, v / vol_ma)
 
     hl_r = np.where(c == 0, np.nan, (h - l) / c * 100.0)
     rng = h - l
@@ -137,6 +146,7 @@ def calcular_features_array(c, h, l, o, v):
     wl_r = mxh - mnl
     will = np.where(wl_r == 0, 0.5, (c - mnl) / wl_r)
 
+    # Base 20
     feats[:, 0] = rsi/100.0; feats[:, 1] = macd_line/atr_s; feats[:, 2] = macd_sig/atr_s
     feats[:, 3] = macd_hist/atr_s; feats[:, 4] = np.where(c==0, np.nan, atr14/c)
     feats[:, 5] = bb_pctb; feats[:, 6] = bb_bwp
@@ -148,14 +158,16 @@ def calcular_features_array(c, h, l, o, v):
     feats[:, 15] = vol_rt; feats[:, 16] = hl_r; feats[:, 17] = cl_p
     feats[:, 18] = bd_r; feats[:, 19] = will
 
-    return feats, atr14
+    # v3.0: 4 nuevos features
+    atr_sma50 = sma_calc(atr14, 50)
+    feats[:, 20] = np.where((atr_sma50 == 0) | np.isnan(atr_sma50), 1.0, atr14 / atr_sma50)
+    feats[:, 21] = np.where(atr_s == 0, 0.0, (ema21 - ema50) / atr_s)
 
-def agregar_symbol_id(X_base, symbol_name, n_symbols=4):
-    n = X_base.shape[0]
-    sym_id = SYMBOL_IDS.get(symbol_name, 0)
-    one_hot = np.zeros((n, n_symbols), dtype=np.float64)
-    one_hot[:, sym_id] = 1.0
-    return np.hstack([X_base, one_hot])
+    hours = df.index.hour + df.index.minute / 60.0
+    feats[:, 22] = np.sin(2.0 * np.pi * hours / 24.0)
+    feats[:, 23] = np.cos(2.0 * np.pi * hours / 24.0)
+
+    return feats, atr14
 
 
 # ╔══════════════════════════════════════════════════════════╗
@@ -163,17 +175,13 @@ def agregar_symbol_id(X_base, symbol_name, n_symbols=4):
 # ╚══════════════════════════════════════════════════════════╝
 
 def evaluate_trading_params(y_true, y_pred, atr_vals, threshold, sl_mult, tp_mult, spread_pct):
-    """Evalúa una combinación de parámetros de trading de forma rápida."""
+    """Evalúa una combinación de parámetros de trading."""
     buy_mask = y_pred > threshold
     sell_mask = y_pred < -threshold
 
     if buy_mask.sum() + sell_mask.sum() < 10:
         return {"sharpe": -999, "n_trades": 0, "return_pct": 0, "win_rate": 0}
 
-    # Simular retornos simplificados con ratio TP/SL
-    tp_sl_ratio = tp_mult / sl_mult
-
-    # Para buys: el retorno real clipeado por SL/TP en unidades de ATR
     buy_returns = []
     for idx in np.where(buy_mask)[0]:
         actual_ret = y_true[idx]
@@ -213,19 +221,13 @@ def evaluate_trading_params(y_true, y_pred, atr_vals, threshold, sl_mult, tp_mul
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  OPTIMIZACIÓN POR SÍMBOLO                                ║
+# ║  OPTIMIZACIÓN XAUUSD                                     ║
 # ╚══════════════════════════════════════════════════════════╝
 
-def optimize_symbol(df, simbolo, verbose=True):
-    """Optimiza modelo + parámetros de trading para un símbolo."""
-    c = df["close"].values.astype(np.float64)
-    h = df["high"].values.astype(np.float64)
-    l = df["low"].values.astype(np.float64)
-    o = df["open"].values.astype(np.float64)
-    v = df["volume"].values.astype(np.float64)
-
-    X_base, atr_vals = calcular_features_array(c, h, l, o, v)
-    X_full = agregar_symbol_id(X_base, simbolo)
+def optimize_xauusd(df, verbose=True):
+    """Optimiza modelo + parámetros de trading para XAUUSD."""
+    X_full, atr_vals = calcular_features_v3(df)
+    c = df["close"].values
 
     y = np.full(len(c), np.nan)
     y[:-BARRAS_FUTURO] = (c[BARRAS_FUTURO:] - c[:-BARRAS_FUTURO]) / c[:-BARRAS_FUTURO] * 100.0
@@ -245,8 +247,6 @@ def optimize_symbol(df, simbolo, verbose=True):
     X_te, y_te = X_v[idx_val:], y_v[idx_val:]
     atr_val = atr_v[idx_train:idx_val]
     atr_te = atr_v[idx_val:]
-
-    spread_pct = SPREAD_COST_PCT.get(simbolo, 0.01)
 
     if verbose:
         print(f"  Train: {len(X_tr):,} | Val: {len(X_val):,} | Test: {len(X_te):,}")
@@ -280,11 +280,11 @@ def optimize_symbol(df, simbolo, verbose=True):
         mask_nz = np.abs(y_val) > 0.01
         dir_acc = np.mean(np.sign(y_pred_val[mask_nz]) == np.sign(y_val[mask_nz])) * 100 if mask_nz.sum() > 0 else 50
 
-        # Score: directional accuracy + penalizar overfitting
+        # Penalizar overfitting
         y_pred_tr = pipe.predict(X_tr)
         mask_nz_tr = np.abs(y_tr) > 0.01
         dir_tr = np.mean(np.sign(y_pred_tr[mask_nz_tr]) == np.sign(y_tr[mask_nz_tr])) * 100 if mask_nz_tr.sum() > 0 else 50
-        overfit_penalty = max(0, (dir_tr - dir_acc) - 5) * 0.5  # Penalizar si train >> val
+        overfit_penalty = max(0, (dir_tr - dir_acc) - 3) * 0.5  # Penalizar gap > 3pp
         score = dir_acc - overfit_penalty
 
         if score > best_model_score:
@@ -292,7 +292,7 @@ def optimize_symbol(df, simbolo, verbose=True):
             best_model_params = {"n_estimators": n_est, "max_depth": depth, "min_samples_leaf": leaf}
             best_pipeline = pipe
 
-        if verbose and (i + 1) % 6 == 0:
+        if verbose and (i + 1) % 9 == 0:
             print(f"    {i+1}/{len(model_combos)} combinaciones evaluadas...")
 
     if verbose:
@@ -314,10 +314,10 @@ def optimize_symbol(df, simbolo, verbose=True):
     ))
 
     for thr, sl_m, tp_m in trading_combos:
-        if tp_m <= sl_m:  # TP debe ser mayor que SL para tener sentido
+        if tp_m <= sl_m:
             continue
 
-        result = evaluate_trading_params(y_val, y_pred_val, atr_val, thr, sl_m, tp_m, spread_pct)
+        result = evaluate_trading_params(y_val, y_pred_val, atr_val, thr, sl_m, tp_m, SPREAD_COST_PCT)
 
         if result["sharpe"] > best_trading_score and result["n_trades"] >= 20:
             best_trading_score = result["sharpe"]
@@ -330,7 +330,7 @@ def optimize_symbol(df, simbolo, verbose=True):
 
     if best_trading_params is None:
         best_trading_params = {
-            "threshold": 0.15, "sl_atr_mult": 2.0, "tp_atr_mult": 3.0,
+            "threshold": 0.15, "sl_atr_mult": 2.0, "tp_atr_mult": 3.5,
             "sharpe": 0, "n_trades": 0, "return_pct": 0, "win_rate": 0,
         }
 
@@ -350,7 +350,7 @@ def optimize_symbol(df, simbolo, verbose=True):
         best_trading_params["threshold"],
         best_trading_params["sl_atr_mult"],
         best_trading_params["tp_atr_mult"],
-        spread_pct,
+        SPREAD_COST_PCT,
     )
 
     mask_nz_te = np.abs(y_te) > 0.01
@@ -384,71 +384,66 @@ def optimize_symbol(df, simbolo, verbose=True):
 
 if __name__ == "__main__":
     print("=" * 65)
-    print("  OPTIMIZACION DE PARAMETROS - HybridAI v2.0")
+    print("  OPTIMIZACION DE PARAMETROS v3.0 - XAUUSD ONLY")
     print("=" * 65)
     print(f"\n  Grid del modelo: {len(list(itertools.product(*MODEL_GRID.values())))} combinaciones")
     print(f"  Grid de trading: {len(list(itertools.product(*TRADING_GRID.values())))} combinaciones")
 
-    all_optimal = {}
+    archivo = f"{CARPETA_DATOS}/{SIMBOLO}_m15.csv"
+    if not os.path.exists(archivo):
+        print(f"\n  ERROR: {archivo} no encontrado")
+        print(f"  -> Ejecuta primero: python 2_descargar_datos.py")
+        exit(1)
 
-    for simbolo in SIMBOLOS:
-        archivo = f"{CARPETA_DATOS}/{simbolo}_m15.csv"
-        if not os.path.exists(archivo):
-            print(f"\n  {archivo} no encontrado, saltando...")
-            continue
-
-        print(f"\n{'='*65}")
-        print(f"  OPTIMIZANDO: {simbolo.upper()}")
-        print(f"{'='*65}")
-
-        df = pd.read_csv(archivo, index_col=0, parse_dates=True)
-        df = df[~df.index.duplicated(keep='first')].sort_index()
-        df = df[(df["close"] > 0) & (df["high"] > 0) & (df["low"] > 0)]
-        df = df[df["high"] >= df["low"]]
-
-        print(f"  Datos: {len(df):,} barras  |  {df.index[0].date()} -> {df.index[-1].date()}")
-
-        result = optimize_symbol(df, simbolo)
-        all_optimal[simbolo.upper()] = result
-
-    # ── RESUMEN FINAL ──
-    print(f"\n\n{'='*65}")
-    print(f"  PARAMETROS OPTIMOS POR SIMBOLO")
+    print(f"\n{'='*65}")
+    print(f"  OPTIMIZANDO: XAUUSD")
     print(f"{'='*65}")
 
-    for sym, opt in all_optimal.items():
-        mp = opt["model_params"]
-        tp = opt["trading_params"]
-        te = opt["test"]
-        print(f"\n  {sym}:")
-        print(f"    Modelo: trees={mp['n_estimators']}, depth={mp['max_depth']}, leaf={mp['min_samples_leaf']}")
-        print(f"    Trading: thr={tp['threshold']}, SL={tp['sl_atr_mult']}xATR, TP={tp['tp_atr_mult']}xATR")
-        print(f"    Test: Dir={te['directional_accuracy']:.1f}%, Sharpe={te['sharpe']:.2f}, "
-              f"WinR={te['win_rate']:.1f}%, Trades={te['n_trades']}")
+    df = pd.read_csv(archivo, index_col=0, parse_dates=True)
+    df = df[~df.index.duplicated(keep='first')].sort_index()
+    df = df[(df["close"] > 0) & (df["high"] > 0) & (df["low"] > 0)]
+    df = df[df["high"] >= df["low"]]
+
+    print(f"  Datos: {len(df):,} barras  |  {df.index[0].date()} -> {df.index[-1].date()}")
+
+    result = optimize_xauusd(df)
+
+    # ── RESUMEN ──
+    print(f"\n\n{'='*65}")
+    print(f"  PARAMETROS OPTIMOS - XAUUSD")
+    print(f"{'='*65}")
+
+    mp = result["model_params"]
+    tp = result["trading_params"]
+    te = result["test"]
+    print(f"\n  Modelo: trees={mp['n_estimators']}, depth={mp['max_depth']}, leaf={mp['min_samples_leaf']}")
+    print(f"  Trading: thr={tp['threshold']}, SL={tp['sl_atr_mult']}xATR, TP={tp['tp_atr_mult']}xATR")
+    print(f"  Test: Dir={te['directional_accuracy']:.1f}%, Sharpe={te['sharpe']:.2f}, "
+          f"WinR={te['win_rate']:.1f}%, Trades={te['n_trades']}")
 
     # Guardar
     opt_path = f"{CARPETA_MODELO}/optimal_params.json"
     with open(opt_path, "w") as f:
-        json.dump(all_optimal, f, indent=2, ensure_ascii=False)
+        json.dump({"XAUUSD": result}, f, indent=2, ensure_ascii=False)
 
-    print(f"\n  Resultados guardados: {opt_path}")
-
-    # Generar config/symbols.json para el EA
+    # Actualizar config/symbols.json con parámetros óptimos
     os.makedirs("config", exist_ok=True)
-    symbols_config = {}
-    for sym, opt in all_optimal.items():
-        tp = opt["trading_params"]
-        symbols_config[sym] = {
+    sym_cfg = {
+        "XAUUSD": {
             "threshold_buy": tp["threshold"],
             "threshold_sell": -tp["threshold"],
             "sl_atr_mult": tp["sl_atr_mult"],
             "tp_atr_mult": tp["tp_atr_mult"],
-            "symbol_id": SYMBOL_IDS.get(sym.lower(), 0),
+            "max_lots": 5.0,
+            "max_drawdown_pct": 20.0,
+            "vol_regime_min": 0.6,
+            "vol_regime_max": 1.8,
         }
-
+    }
     sym_path = "config/symbols.json"
     with open(sym_path, "w") as f:
-        json.dump(symbols_config, f, indent=2, ensure_ascii=False)
+        json.dump(sym_cfg, f, indent=2, ensure_ascii=False)
 
+    print(f"\n  Resultados guardados: {opt_path}")
     print(f"  Config por simbolo: {sym_path}")
     print("=" * 65)
