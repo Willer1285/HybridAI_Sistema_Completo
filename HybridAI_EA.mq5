@@ -1,15 +1,15 @@
 //+------------------------------------------------------------------+
-//|                                        HybridAI_EA.mq5  v2.0    |
+//|                                        HybridAI_EA.mq5  v3.0    |
 //|          Sistema de Trading con Inteligencia Artificial           |
 //|          Modelo: ExtraTrees + ONNX | Timeframe: M15              |
-//|          Instrumentos: XAU/USD, EUR/USD, GBP/USD, USD/JPY        |
+//|          Instrumento: XAUUSD (Gold) solamente                    |
 //|                                                                  |
-//|  v2.0: Trailing stop, filtro de spread, symbol_id (24 features), |
-//|        detección automática de filling mode, cierre de contrarias |
+//|  v3.0: Features de régimen de volatilidad, fuerza de tendencia,  |
+//|        hora cíclica. Cap de lotes. Sin multi-symbol.             |
 //+------------------------------------------------------------------+
-#property copyright   "HybridAI Trading System 2026 v2.0"
-#property description "EA con modelo de IA (ONNX) para señales de trading"
-#property version     "2.00"
+#property copyright   "HybridAI Trading System 2026 v3.0"
+#property description "EA con modelo de IA (ONNX) para XAUUSD"
+#property version     "3.00"
 #property strict
 #property tester_file "hybrid_ai_model.onnx"
 
@@ -31,8 +31,9 @@ input double   InpUmbralVenta    = -0.15;   // Vender  si predicción < este val
 input group "==== GESTIÓN DE RIESGO ======================="
 input double   InpRiesgoPct      =  1.0;    // Riesgo por operación (% del balance)
 input double   InpSL_ATR_Mult    =  2.0;    // Stop Loss  = ATR x este multiplicador
-input double   InpTP_ATR_Mult    =  3.0;    // Take Profit= ATR x este multiplicador
+input double   InpTP_ATR_Mult    =  3.5;    // Take Profit= ATR x este multiplicador
 input int      InpMaxTrades      =  1;      // Máximo de trades abiertos a la vez
+input double   InpMaxLotes       =  5.0;    // Máximo de lotes por operación
 
 input group "==== TRAILING STOP ==========================="
 input bool     InpTrailingStop   = true;     // Activar trailing stop
@@ -48,7 +49,6 @@ input double   InpMaxSpreadATR   =  0.10;   // Spread maximo como % del ATR
 
 input group "==== AVANZADO ================================"
 input bool     InpCerrarContraria = true;   // Cerrar posición contraria antes de abrir
-input int      InpSymbolID       = -1;      // ID del símbolo (-1=autodetect, 0=XAUUSD,1=EUR,2=GBP,3=JPY)
 
 input group "==== IDENTIFICACIÓN =========================="
 input int      InpMagicNumber    = 246810;  // Número mágico del EA
@@ -68,10 +68,8 @@ int       g_h_ema9   = INVALID_HANDLE;
 int       g_h_ema21  = INVALID_HANDLE;
 int       g_h_ema50  = INVALID_HANDLE;
 
-int       g_symbol_id = 0;  // 0=XAUUSD, 1=EURUSD, 2=GBPUSD, 3=USDJPY
-
-#define N_FEAT    24      // 20 técnicos + 4 one-hot symbol (v2.0)
-#define LOOKBACK  60      // Barras mínimas para calentar indicadores
+#define N_FEAT    24      // 20 técnicos + vol_regime + trend_str + hour_sin + hour_cos (v3.0)
+#define LOOKBACK  65      // Barras mínimas para calentar indicadores (50 para ATR SMA50)
 
 //====================================================================
 //  DETECCIÓN AUTOMÁTICA DE FILLING MODE
@@ -85,20 +83,6 @@ ENUM_ORDER_TYPE_FILLING DetectFillingMode()
 }
 
 //====================================================================
-//  AUTODETECCIÓN DEL SYMBOL ID
-//====================================================================
-int DetectSymbolID()
-{
-   string sym = _Symbol;
-   StringToUpper(sym);
-   if(StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0)  return 0;
-   if(StringFind(sym, "EURUSD") >= 0) return 1;
-   if(StringFind(sym, "GBPUSD") >= 0) return 2;
-   if(StringFind(sym, "USDJPY") >= 0) return 3;
-   return 0;  // Default
-}
-
-//====================================================================
 //  INICIALIZACIÓN
 //====================================================================
 
@@ -108,9 +92,6 @@ int OnInit()
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(30);
    g_trade.SetTypeFilling(DetectFillingMode());
-
-   //-- Detectar symbol ID
-   g_symbol_id = (InpSymbolID >= 0) ? InpSymbolID : DetectSymbolID();
 
    //-- Cargar el modelo ONNX
    g_onnx = OnnxCreate(InpModelFile, ONNX_DEFAULT);
@@ -159,13 +140,14 @@ int OnInit()
 
    //-- Log de inicio
    Print("================================================================");
-   Print("    HybridAI EA v2.0 - Sistema de Trading con IA");
+   Print("    HybridAI EA v3.0 - XAUUSD Only");
    Print("================================================================");
-   Print("  Simbolo  : ", _Symbol, "  (ID=", g_symbol_id, ")");
+   Print("  Simbolo  : ", _Symbol);
    Print("  Timeframe: ", EnumToString(PERIOD_CURRENT));
    Print("  Modelo   : ", InpModelFile, " -> CARGADO (", N_FEAT, " features)");
    Print("  Umbral   : Compra >", InpUmbralCompra, "%  |  Venta <", InpUmbralVenta, "%");
    Print("  Riesgo   : ", InpRiesgoPct, "%  |  SL=", InpSL_ATR_Mult, "xATR  |  TP=", InpTP_ATR_Mult, "xATR");
+   Print("  Max lotes: ", InpMaxLotes);
    Print("  Trailing : ", InpTrailingStop ? "ON" : "OFF",
          "  (", InpTrailATR_Mult, "xATR, BE=", InpBreakeven_ATR, "xATR)");
    Print("  Spread   : ", InpFiltroSpread ? "Filtro ON" : "Sin filtro",
@@ -188,7 +170,7 @@ void OnDeinit(const int reason)
    for(int i = 0; i < ArraySize(handles); i++)
       if(handles[i] != INVALID_HANDLE) IndicatorRelease(handles[i]);
 
-   Print("HybridAI v2.0 detenido.");
+   Print("HybridAI v3.0 detenido.");
 }
 
 //====================================================================
@@ -231,7 +213,7 @@ void OnTick()
       if(spread_val > atr_current * InpMaxSpreadATR) return;
    }
 
-   //-- Calcular los 24 features
+   //-- Calcular los 24 features v3.0
    matrixf features(1, N_FEAT);
    if(!CalcularFeatures(features)) return;
 
@@ -278,7 +260,12 @@ void OnTick()
 }
 
 //====================================================================
-//  CALCULAR 24 FEATURES  <- DEBE SER IDÉNTICO AL PYTHON v2.0
+//  CALCULAR 24 FEATURES v3.0  <- DEBE SER IDÉNTICO AL PYTHON v3.0
+//  0-19:  Indicadores técnicos base
+//  20:    vol_regime  = ATR(14) / SMA(ATR(14), 50)
+//  21:    trend_str   = (EMA21 - EMA50) / ATR(14)
+//  22:    hour_sin    = sin(2π * hora / 24)
+//  23:    hour_cos    = cos(2π * hora / 24)
 //====================================================================
 
 bool CalcularFeatures(matrixf &feat)
@@ -395,11 +382,24 @@ bool CalcularFeatures(matrixf &feat)
    // 19  Williams %R normalizado [0,1]
    feat[0][19] = (float)(willr_rng > 0 ? (c0 - min_l) / willr_rng : 0.5);
 
-   //-- Features 20-23: Symbol one-hot encoding (v2.0)
-   feat[0][20] = (float)(g_symbol_id == 0 ? 1.0 : 0.0);  // XAUUSD
-   feat[0][21] = (float)(g_symbol_id == 1 ? 1.0 : 0.0);  // EURUSD
-   feat[0][22] = (float)(g_symbol_id == 2 ? 1.0 : 0.0);  // GBPUSD
-   feat[0][23] = (float)(g_symbol_id == 3 ? 1.0 : 0.0);  // USDJPY
+   //-- Features 20-23: v3.0 (régimen, tendencia, hora cíclica)
+
+   // 20  vol_regime = ATR(14) / SMA(ATR(14), 50)
+   //     Calculamos media simple de las últimas 50 barras de ATR
+   double atr_sum50 = 0;
+   for(int i = 0; i < 50; i++) atr_sum50 += atr[i];
+   double atr_sma50 = atr_sum50 / 50.0;
+   feat[0][20] = (float)(atr_sma50 > 0 ? atr0 / atr_sma50 : 1.0);
+
+   // 21  trend_strength = (EMA21 - EMA50) / ATR(14)
+   feat[0][21] = (float)((ema21a[0] - ema50a[0]) / atr0);
+
+   // 22-23  Codificación cíclica de la hora
+   MqlDateTime bar_time;
+   TimeToStruct(iTime(_Symbol, PERIOD_CURRENT, 1), bar_time);
+   double hora = (double)bar_time.hour + (double)bar_time.min / 60.0;
+   feat[0][22] = (float)(MathSin(2.0 * M_PI * hora / 24.0));
+   feat[0][23] = (float)(MathCos(2.0 * M_PI * hora / 24.0));
 
    return true;
 }
@@ -459,6 +459,7 @@ void AbrirOperacion(ENUM_ORDER_TYPE tipo, double pred)
 
 //====================================================================
 //  CALCULAR TAMAÑO DE LOTE POR RIESGO FIJO (% DEL BALANCE)
+//  Con cap máximo de InpMaxLotes (v3.0)
 //====================================================================
 
 double CalcularLotes(double distancia_sl)
@@ -481,7 +482,10 @@ double CalcularLotes(double distancia_sl)
 
    double lotes = riesgo_usd / riesgo_lot;
    lotes = MathFloor(lotes / vol_step) * vol_step;
-   lotes = MathMax(vol_min, MathMin(vol_max, lotes));
+
+   // Cap de lotes v3.0
+   double cap = MathMin(vol_max, InpMaxLotes);
+   lotes = MathMax(vol_min, MathMin(cap, lotes));
 
    return lotes;
 }
