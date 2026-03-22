@@ -124,8 +124,7 @@ int OnInit()
    {
       OnnxTypeInfo type_info;
       OnnxGetInputTypeInfo(g_onnx, i, type_info);
-      string name;
-      OnnxGetInputName(g_onnx, i, name);
+      string name = OnnxGetInputName(g_onnx, i);
       Print("  Input ", i, ": name=", name,
             " type=", EnumToString(type_info.tensor.data_type));
    }
@@ -133,8 +132,7 @@ int OnInit()
    {
       OnnxTypeInfo type_info;
       OnnxGetOutputTypeInfo(g_onnx, i, type_info);
-      string name;
-      OnnxGetOutputName(g_onnx, i, name);
+      string name = OnnxGetOutputName(g_onnx, i);
       Print("  Output ", i, ": name=", name,
             " type=", EnumToString(type_info.tensor.data_type));
    }
