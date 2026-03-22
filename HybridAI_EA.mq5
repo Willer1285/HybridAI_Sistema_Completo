@@ -114,20 +114,70 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   //-- Diagnosticar modelo ONNX
+   long n_inputs  = OnnxGetInputCount(g_onnx);
+   long n_outputs = OnnxGetOutputCount(g_onnx);
+   Print("ONNX cargado: ", n_inputs, " inputs, ", n_outputs, " outputs");
+
+   // Mostrar info de cada input/output
+   for(long i = 0; i < n_inputs; i++)
+   {
+      OnnxTypeInfo type_info;
+      OnnxGetInputTypeInfo(g_onnx, i, type_info);
+      string name;
+      OnnxGetInputName(g_onnx, i, name);
+      Print("  Input ", i, ": name=", name,
+            " type=", EnumToString(type_info.tensor.data_type));
+   }
+   for(long i = 0; i < n_outputs; i++)
+   {
+      OnnxTypeInfo type_info;
+      OnnxGetOutputTypeInfo(g_onnx, i, type_info);
+      string name;
+      OnnxGetOutputName(g_onnx, i, name);
+      Print("  Output ", i, ": name=", name,
+            " type=", EnumToString(type_info.tensor.data_type));
+   }
+
+   //-- Configurar shapes
    long sh_in[]  = {1, N_FEAT};
-   //-- Para clasificador sklearn ONNX:
-   //   Output 0 = labels (int64, shape [1])
-   //   Output 1 = probabilities (float, shape [1, 3])
-   //   Usamos las probabilidades (output 1) que son float y más compatibles
-   long sh_out_label[] = {1};
-   long sh_out_prob[]  = {1, 3};   // 3 clases: NEUTRAL, BUY, SELL
 
    if(!OnnxSetInputShape(g_onnx, 0, sh_in))
-   { Alert("HybridAI: Error input shape. Codigo: ", GetLastError()); return INIT_FAILED; }
+   {
+      Print("ERROR: Input shape {1,", N_FEAT, "} fallo. Codigo: ", GetLastError());
+      // Intentar sin batch dimension
+      long sh_in2[] = {N_FEAT};
+      if(!OnnxSetInputShape(g_onnx, 0, sh_in2))
+      {
+         Alert("HybridAI: Input shape fallo con ambos formatos. Codigo: ", GetLastError());
+         return INIT_FAILED;
+      }
+      Print("Input shape alternativo {", N_FEAT, "} aceptado");
+   }
+   else
+      Print("Input shape {1, ", N_FEAT, "} OK");
+
+   //-- Output 0: labels (int64)
+   long sh_out_label[] = {1};
    if(!OnnxSetOutputShape(g_onnx, 0, sh_out_label))
-   { Alert("HybridAI: Error output 0 (label) shape. Codigo: ", GetLastError()); return INIT_FAILED; }
-   if(!OnnxSetOutputShape(g_onnx, 1, sh_out_prob))
-   { Alert("HybridAI: Error output 1 (prob) shape. Codigo: ", GetLastError()); return INIT_FAILED; }
+   {
+      Print("WARN: Output 0 shape {1} fallo (", GetLastError(), "), intentando sin shape...");
+      // Algunos modelos no necesitan output shape explícito
+   }
+   else
+      Print("Output 0 (label) shape {1} OK");
+
+   //-- Output 1: probabilities (float, shape [1, 3])
+   if(n_outputs > 1)
+   {
+      long sh_out_prob[] = {1, 3};
+      if(!OnnxSetOutputShape(g_onnx, 1, sh_out_prob))
+      {
+         Print("WARN: Output 1 shape {1,3} fallo (", GetLastError(), ")");
+      }
+      else
+         Print("Output 1 (prob) shape {1, 3} OK");
+   }
 
    //-- Indicadores M15
    g_h_atr   = iATR (_Symbol, PERIOD_M15, 14);
@@ -234,23 +284,36 @@ void OnTick()
    matrixf features(1, N_FEAT);
    if(!CalcularFeatures(features)) return;
 
-   // Inferencia ONNX - clasificador con 2 outputs
-   vectorf out_label(1);       // Output 0: clase predicha
+   // Inferencia ONNX - clasificador con 2 outputs (label + probabilities)
+   vectorf out_label(1);       // Output 0: clase predicha (int64 -> cast a float)
    matrixf out_prob(1, 3);     // Output 1: probabilidades [NEUTRAL, BUY, SELL]
 
-   if(!OnnxRun(g_onnx, ONNX_DEFAULT, features, out_label, out_prob))
-   {
-      Print("OnnxRun fallo | Error: ", GetLastError());
-      return;
-   }
+   bool run_ok = OnnxRun(g_onnx, ONNX_DEFAULT, features, out_label, out_prob);
 
-   // Determinar clase usando probabilidades (más robusto)
    int clase = 0;  // default NEUTRAL
-   float max_prob = out_prob[0][0];
-   for(int k = 1; k < 3; k++)
+
+   if(!run_ok)
    {
-      if(out_prob[0][k] > max_prob)
-      { max_prob = out_prob[0][k]; clase = k; }
+      // Intentar con solo 1 output (label)
+      vectorf out_single(1);
+      if(!OnnxRun(g_onnx, ONNX_DEFAULT, features, out_single))
+      {
+         static int err_count = 0;
+         if(++err_count <= 3)
+            Print("OnnxRun fallo | Error: ", GetLastError());
+         return;
+      }
+      clase = (int)out_single[0];
+   }
+   else
+   {
+      // Determinar clase usando probabilidades (más robusto)
+      float max_prob = out_prob[0][0];
+      for(int k = 1; k < 3; k++)
+      {
+         if(out_prob[0][k] > max_prob)
+         { max_prob = out_prob[0][k]; clase = k; }
+      }
    }
 
    // Log cada 10 barras
