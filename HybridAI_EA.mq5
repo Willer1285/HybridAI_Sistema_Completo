@@ -23,6 +23,10 @@
 input group "==== MODELO IA ==============================="
 input string   InpModelFile      = "hybrid_ai_model.onnx";
 
+input group "==== UMBRALES DE SEÑAL ========================"
+input double   InpUmbralBuy      =  0.45;   // Probabilidad mínima para COMPRA (0.0-1.0)
+input double   InpUmbralSell     =  0.45;   // Probabilidad mínima para VENTA  (0.0-1.0)
+
 input group "==== GESTIÓN DE RIESGO ======================="
 input double   InpRiesgoPct      =  1.0;    // Riesgo por operación (% del balance)
 input double   InpSL_ATR_Mult    =  2.0;    // Stop Loss  = ATR x este multiplicador
@@ -222,6 +226,7 @@ int OnInit()
    Print("  Simbolo  : ", _Symbol);
    Print("  Modelo   : ", InpModelFile, " (", N_FEAT, " features, clasificacion)");
    Print("  Riesgo   : ", InpRiesgoPct, "%  SL=", InpSL_ATR_Mult, "xATR  TP=", InpTP_ATR_Mult, "xATR");
+   Print("  Umbrales : BUY>=", InpUmbralBuy, "  SELL>=", InpUmbralSell);
    Print("  Max lotes: ", InpMaxLotes);
    Print("  Clases   : 0=NEUTRAL, 1=BUY, 2=SELL");
    Print("================================================================");
@@ -289,6 +294,7 @@ void OnTick()
    bool run_ok = OnnxRun(g_onnx, ONNX_DEFAULT, features, out_label, out_prob);
 
    int clase = 0;  // default NEUTRAL
+   float prob_neutral = 0.0f, prob_buy = 0.0f, prob_sell = 0.0f;
 
    if(!run_ok)
    {
@@ -302,16 +308,22 @@ void OnTick()
          return;
       }
       clase = (int)out_single[0];
+      // Sin probabilidades, asignar 1.0 a la clase predicha
+      if(clase == 0) prob_neutral = 1.0f;
+      else if(clase == 1) prob_buy = 1.0f;
+      else prob_sell = 1.0f;
    }
    else
    {
-      // Determinar clase usando probabilidades (más robusto)
-      float max_prob = out_prob[0][0];
-      for(int k = 1; k < 3; k++)
-      {
-         if(out_prob[0][k] > max_prob)
-         { max_prob = out_prob[0][k]; clase = k; }
-      }
+      prob_neutral = out_prob[0][0];
+      prob_buy     = out_prob[0][1];
+      prob_sell    = out_prob[0][2];
+
+      // Determinar clase usando probabilidades
+      float max_prob = prob_neutral;
+      clase = 0;
+      if(prob_buy  > max_prob) { max_prob = prob_buy;  clase = 1; }
+      if(prob_sell > max_prob) { max_prob = prob_sell; clase = 2; }
    }
 
    // Log cada 10 barras
@@ -321,32 +333,32 @@ void OnTick()
       string clase_str = (clase == 1) ? "BUY" : (clase == 2) ? "SELL" : "NEUTRAL";
       Print(_Symbol, " | ", TimeToString(barra_actual, TIME_DATE|TIME_MINUTES),
             " | Clase: ", clase_str,
-            " | P[N]=", DoubleToString(out_prob[0][0], 3),
-            " P[B]=", DoubleToString(out_prob[0][1], 3),
-            " P[S]=", DoubleToString(out_prob[0][2], 3));
+            " | P[N]=", DoubleToString(prob_neutral, 3),
+            " P[B]=", DoubleToString(prob_buy, 3),
+            " P[S]=", DoubleToString(prob_sell, 3));
    }
 
    int n_buy  = ContarPosiciones(POSITION_TYPE_BUY);
    int n_sell = ContarPosiciones(POSITION_TYPE_SELL);
    int n_tot  = n_buy + n_sell;
 
-   // SEÑAL DE COMPRA
-   if(clase == 1)
+   // SEÑAL DE COMPRA: clase BUY + probabilidad >= umbral
+   if(clase == 1 && prob_buy >= (float)InpUmbralBuy)
    {
       if(InpCerrarContraria && n_sell > 0)
          CerrarPosiciones(POSITION_TYPE_SELL);
       if(n_buy == 0 && n_tot < InpMaxTrades)
          AbrirOperacion(ORDER_TYPE_BUY, clase);
    }
-   // SEÑAL DE VENTA
-   else if(clase == 2)
+   // SEÑAL DE VENTA: clase SELL + probabilidad >= umbral
+   else if(clase == 2 && prob_sell >= (float)InpUmbralSell)
    {
       if(InpCerrarContraria && n_buy > 0)
          CerrarPosiciones(POSITION_TYPE_BUY);
       if(n_sell == 0 && n_tot < InpMaxTrades)
          AbrirOperacion(ORDER_TYPE_SELL, clase);
    }
-   // clase == 0 → NEUTRAL, no hacer nada
+   // NEUTRAL o probabilidad por debajo del umbral → no operar
 }
 
 //====================================================================
