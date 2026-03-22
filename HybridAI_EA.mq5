@@ -115,12 +115,19 @@ int OnInit()
    }
 
    long sh_in[]  = {1, N_FEAT};
-   long sh_out[] = {1, 1};
+   //-- Para clasificador sklearn ONNX:
+   //   Output 0 = labels (int64, shape [1])
+   //   Output 1 = probabilities (float, shape [1, 3])
+   //   Usamos las probabilidades (output 1) que son float y más compatibles
+   long sh_out_label[] = {1};
+   long sh_out_prob[]  = {1, 3};   // 3 clases: NEUTRAL, BUY, SELL
 
    if(!OnnxSetInputShape(g_onnx, 0, sh_in))
-   { Alert("HybridAI: Error input shape"); return INIT_FAILED; }
-   if(!OnnxSetOutputShape(g_onnx, 0, sh_out))
-   { Alert("HybridAI: Error output shape"); return INIT_FAILED; }
+   { Alert("HybridAI: Error input shape. Codigo: ", GetLastError()); return INIT_FAILED; }
+   if(!OnnxSetOutputShape(g_onnx, 0, sh_out_label))
+   { Alert("HybridAI: Error output 0 (label) shape. Codigo: ", GetLastError()); return INIT_FAILED; }
+   if(!OnnxSetOutputShape(g_onnx, 1, sh_out_prob))
+   { Alert("HybridAI: Error output 1 (prob) shape. Codigo: ", GetLastError()); return INIT_FAILED; }
 
    //-- Indicadores M15
    g_h_atr   = iATR (_Symbol, PERIOD_M15, 14);
@@ -227,15 +234,24 @@ void OnTick()
    matrixf features(1, N_FEAT);
    if(!CalcularFeatures(features)) return;
 
-   // Inferencia ONNX - clasificación: salida es la clase (0, 1, 2)
-   vectorf salida(1);
-   if(!OnnxRun(g_onnx, ONNX_DEFAULT, features, salida))
+   // Inferencia ONNX - clasificador con 2 outputs
+   vectorf out_label(1);       // Output 0: clase predicha
+   matrixf out_prob(1, 3);     // Output 1: probabilidades [NEUTRAL, BUY, SELL]
+
+   if(!OnnxRun(g_onnx, ONNX_DEFAULT, features, out_label, out_prob))
    {
       Print("OnnxRun fallo | Error: ", GetLastError());
       return;
    }
 
-   int clase = (int)salida[0];  // 0=NEUTRAL, 1=BUY, 2=SELL
+   // Determinar clase usando probabilidades (más robusto)
+   int clase = 0;  // default NEUTRAL
+   float max_prob = out_prob[0][0];
+   for(int k = 1; k < 3; k++)
+   {
+      if(out_prob[0][k] > max_prob)
+      { max_prob = out_prob[0][k]; clase = k; }
+   }
 
    // Log cada 10 barras
    static int cnt = 0;
@@ -243,7 +259,10 @@ void OnTick()
    {
       string clase_str = (clase == 1) ? "BUY" : (clase == 2) ? "SELL" : "NEUTRAL";
       Print(_Symbol, " | ", TimeToString(barra_actual, TIME_DATE|TIME_MINUTES),
-            " | Clase IA: ", clase_str);
+            " | Clase: ", clase_str,
+            " | P[N]=", DoubleToString(out_prob[0][0], 3),
+            " P[B]=", DoubleToString(out_prob[0][1], 3),
+            " P[S]=", DoubleToString(out_prob[0][2], 3));
    }
 
    int n_buy  = ContarPosiciones(POSITION_TYPE_BUY);
